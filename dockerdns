@@ -226,7 +226,10 @@ class DockerMonitor(object):
         return [ '.'.join((name, self._domain)) for name in names ]
 
     def _get_addrs(self, networks):
-        return [ value['IPAddress'] for value in networks.values() ]
+        return [ value['IPAddress'] for value in networks.values() if value ]
+
+    def _get_addr6s(self, networks):
+        return [ value['GlobalIPv6Address'] for value in networks.values() if value ]
 
     def _inspect(self, cid):
         # get full details on this container from docker
@@ -243,6 +246,12 @@ class DockerMonitor(object):
 
         networks = get(rec, 'NetworkSettings', 'Networks')
         ip_addrs = self._get_addrs(networks)
+        ip_addr6s = self._get_addr6s(networks)
+
+        for addr in ip_addrs:
+            log('inspect container %s: addr=%s', name, addr)
+        for addr in ip_addr6s:
+            log('inspect container %s: addr6=%s', name, addr)
 
         hostname = '%s.%s' % (get(rec, 'Config', 'Hostname'), self._domain)
         containers = list(Container(id_, name, state, ip_addrs) for name in self._get_names(name, labels))
