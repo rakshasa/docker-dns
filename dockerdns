@@ -3,26 +3,16 @@
 
 # dockerdns - simple, automatic, self-contained dns server for docker
 
-# python 3 compatibility
-from __future__ import print_function
-
 # monkey patch everything
 from gevent import monkey
 monkey.patch_all()
-
-# python 3 compatibility
-from future import standard_library
-from functools import reduce
-standard_library.install_aliases()
-from builtins import map
-from builtins import str
-from builtins import object
 
 # core
 import argparse
 from collections import defaultdict
 from collections import namedtuple
 from datetime import datetime
+from functools import reduce
 import json
 import os
 import re
@@ -32,23 +22,23 @@ import time
 from urllib.parse import urlparse
 
 # libs
-from dnslib import A, DNSHeader, DNSLabel, DNSRecord, PTR, QTYPE, RR
+from dnslib import A, AAAA, DNSHeader, DNSLabel, DNSRecord, PTR, QTYPE, RR
 import docker
 import gevent
 from gevent import socket, threading
 from gevent.server import DatagramServer
-from gevent.resolver_ares import Resolver
-from ipaddress import ip_network, ip_address
+from gevent.resolver.ares import Resolver
+from ipaddress import ip_network, ip_address, IPv4Address, IPv6Address
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PROCESS = 'dockerdns'
 DOCKER_SOCK = 'unix:///docker.sock'
-DNS_BINDADDR = '0.0.0.0:53'
+DNS_BINDADDR = '[::]:53'
 DNS_RESOLVER = ['8.8.8.8']
 DNS_RESOLVER_TIMEOUT = 3.0
-RE_VALIDNAME = re.compile('[^\w\d.-]')
+RE_VALIDNAME = re.compile(r'[^\w\d.-]')
 QUIET = 0
 EPILOG = '''
 
@@ -94,23 +84,29 @@ class NameTable(object):
             self.add(rec[0], rec[1])
 
     def add(self, name, addr):
+        if not addr:
+            log('skipping table.add %s -> %s (no address)', name, addr)
+            return
         if name.startswith('.'):
             name = '*' + name
         key = self._key(name)
         if key:
             with self._lock:
+                ip_addr = ip_address(addr)
+
                 for network in network_blacklist:
-                    if addr and ip_address(addr) in network:
+                    if ip_addr in network:
                         log('skipping table.add %s -> %s (blacklisted network)', name, addr)
                         return
                 log('table.add %s -> %s', name, addr)
-                self._storage[key].add(addr)
+                self._storage[key].add(ip_addr)
 
                 # reverse map for PTR records
-                addr = '%s.in-addr.arpa' % '.'.join(reversed(addr.split('.')))
-                key = self._key(addr)
-                log('table.add %s -> %s', addr, name)
-                self._storage[key].add(name)
+                if ip_addr.version == 4:
+                    addr = '%s.in-addr.arpa' % '.'.join(reversed(addr.split('.')))
+                    key = self._key(addr)
+                    log('table.add %s -> %s', addr, name)
+                    self._storage[key].add(name)
 
     def get(self, name):
         key = self._key(name)
@@ -123,13 +119,12 @@ class NameTable(object):
                 wildres = self._storage.get(wildkey)
 
                 if res:
-                    log('table.get %s with %s' % (name, ", ".join(addr for addr in res)))
+                    return res
                 elif wildres:
-                    log('table.get %s with %s' % (name, ", ".join(addr for addr in wildres)))
-                    res = wildres
+                    return wildres
                 else:
                     log('table.get %s with NoneType' % (name))
-                return res
+                    return set()
 
     def rename(self, old_name, new_name):
         if not old_name or not new_name:
@@ -225,8 +220,11 @@ class DockerMonitor(object):
 
         return [ '.'.join((name, self._domain)) for name in names ]
 
-    def _get_addrs(self, networks):
+    def _get_addrs_4(self, networks):
         return [ value['IPAddress'] for value in networks.values() ]
+
+    def _get_global_addrs_6(self, networks):
+        return [ value['GlobalIPv6Address'] for value in networks.values() ]
 
     def _inspect(self, cid):
         # get full details on this container from docker
@@ -242,11 +240,12 @@ class DockerMonitor(object):
         state = get(rec, 'State', 'Running')
 
         networks = get(rec, 'NetworkSettings', 'Networks')
-        ip_addrs = self._get_addrs(networks)
+        ip_addrs_4 = self._get_addrs_4(networks)
+        ip_addrs_6 = self._get_global_addrs_6(networks)
 
         hostname = '%s.%s' % (get(rec, 'Config', 'Hostname'), self._domain)
-        containers = list(Container(id_, name, state, ip_addrs) for name in self._get_names(name, labels))
-        return containers + [Container(id_, hostname, state, ip_addrs)]
+        containers = list(Container(id_, name, state, ip_addrs_4+ip_addrs_6) for name in self._get_names(name, labels))
+        return containers + [Container(id_, hostname, state, ip_addrs_4+ip_addrs_6)]
 
 
 class DnsServer(DatagramServer):
@@ -270,22 +269,34 @@ class DnsServer(DatagramServer):
         names = set()
         auth = False
         if rec.q.qtype in (QTYPE.A, QTYPE.AAAA, QTYPE.ANY):
-            addrs = self._table.get(rec.q.qname.idna()) or set()
+            name = rec.q.qname.idna()
+            addrs = self._table.get(name) or set()
+
             if addrs:
                 auth = True
-                if rec.q.qtype == QTYPE.AAAA:
-                    addrs = set()
+                if rec.q.qtype == QTYPE.A:
+                    addrs = set(str(addr) for addr in addrs if isinstance(addr, IPv4Address))
+                    log('table.get query.a %s with %s' % (name, ", ".join(str(addr) for addr in addrs)))
+                elif rec.q.qtype == QTYPE.AAAA:
+                    addrs = set(str(addr) for addr in addrs if isinstance(addr, IPv6Address))
+                    log('table.get query.aaaa %s with %s' % (name, ", ".join(str(addr) for addr in addrs)))
+                else:
+                    addrs = set(str(addr) for addr in addrs if isinstance(addr, IPv4Address) or isinstance(addr, IPv6Address))
+                    log('table.get query.any %s with %s' % (name, ", ".join(str(addr) for addr in addrs)))
             else:
-                tmp = self._gethostbyname('.'.join(rec.q.qname.label))
+                log('dns.handle "%s" with not results' % (b'.'.join(rec.q.qname.label)).decode("utf-8"))
+                tmp = self._gethostbyname((b'.'.join(rec.q.qname.label)).decode("utf-8"))
                 if tmp is not None:
                     addrs.add(tmp)
 
         elif rec.q.qtype in (QTYPE.PTR,):
-            key = '.'.join(rec.q.qname.label)
+            key = b'.'.join(rec.q.qname.label)
             names = self._table.get(key) or set()
+            log('table.get query.ptr %s with %s' % (name, ", ".join(str(addr) for addr in names)))
+
             if not names:
-                addr = '.'.join(rec.q.qname.stripSuffix('in-addr.arpa').label)
-                tmp = self._gethostbyaddr(addr)
+                addr = b'.'.join(rec.q.qname.stripSuffix('in-addr.arpa').label)
+                tmp = self._gethostbyaddr(addr.decode("utf-8"))
                 if tmp is not None:
                     names.add(tmp)
 
@@ -293,10 +304,20 @@ class DnsServer(DatagramServer):
 
     def _reply(self, rec, auth, addrs, names):
         reply = DNSRecord(DNSHeader(id=rec.header.id, qr=1, aa=auth, ra=bool(self._resolver)), q=rec.q)
+
         for addr in addrs:
-            reply.add_answer(RR(rec.q.qname, QTYPE.A, rdata=A(addr)))
+            #reply.add_answer(RR(rec.q.qname, QTYPE.A, rdata=A(addr)))
+            # support A and AAAA records
+            if ip_address(addr).version == 4:
+                reply.add_answer(RR(rec.q.qname, QTYPE.A, rdata=A(addr)))
+            elif ip_address(addr).version == 6:
+                reply.add_answer(RR(rec.q.qname, QTYPE.AAAA, rdata=AAAA(addr)))
+            else:
+                log('reply skipping invalid address %s', addr)
+
         for name in names:
             reply.add_answer(RR(rec.q.qname, QTYPE.PTR, rdata=PTR(name)))
+
         return reply.pack()
 
     def _gethostbyname(self, name):
@@ -330,7 +351,7 @@ def stop(*servers):
     sys.exit(signal.SIGINT)
 
 def splitrecord(rec):
-    m = re.match('([a-zA-Z0-9_-]*|\*):((?:[12]?[0-9]{1,2}\.){3}(?:[12]?[0-9]{1,2}){1}$)', rec)
+    m = re.match(r'([a-zA-Z0-9_-]*|\*):((?:[12]?[0-9]{1,2}\.){3}(?:[12]?[0-9]{1,2}){1}$)', rec)
     if not m:
         log('--record has invalid format, expects: `--record <host>:<ip>`')
         sys.exit(1)
@@ -387,13 +408,13 @@ def main():
     client = None
     try:
         client = docker.Client(args.docker, version='auto', tls=tls_config)
-    except docker.errors.TLSParameterError, e:
+    except docker.errors.TLSParameterError as e:
         log('Docker error: %s' % e)
         sys.exit(1)
     monitor = DockerMonitor(client, table, args.domain)
     dns = DnsServer(args.dns_bind, table, resolver)
-    gevent.signal(signal.SIGINT, stop, dns)
-    gevent.signal(signal.SIGTERM, stop, dns)
+    gevent.signal_handler(signal.SIGINT, stop, dns)
+    gevent.signal_handler(signal.SIGTERM, stop, dns)
     dns.start()
     gevent.wait([gevent.spawn(monitor.run)])
 
